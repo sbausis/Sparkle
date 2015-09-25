@@ -29,6 +29,8 @@ NSString *const SUUpdaterAppcastNotificationKey = @"SUUpdaterAppCastNotification
 
 @interface SUUpdater () <SUUpdatePermissionPromptDelegate>
 @property (strong) NSTimer *checkTimer;
+@property (strong) NSBundle *sparkleBundle;
+
 - (instancetype)initForBundle:(NSBundle *)bundle;
 - (void)startUpdateCycle;
 - (void)checkForUpdatesWithDriver:(SUUpdateDriver *)updateDriver;
@@ -51,11 +53,10 @@ NSString *const SUUpdaterAppcastNotificationKey = @"SUUpdaterAppCastNotification
 @synthesize delegate;
 @synthesize checkTimer;
 @synthesize userAgentString = customUserAgentString;
-
+@synthesize httpHeaders;
 @synthesize driver;
 @synthesize host;
-
-#pragma mark Initialization
+@synthesize sparkleBundle;
 
 static NSMutableDictionary *sharedUpdaters = nil;
 static NSString *const SUUpdaterDefaultsObservationContext = @"SUUpdaterDefaultsObservationContext";
@@ -82,6 +83,12 @@ static NSString *const SUUpdaterDefaultsObservationContext = @"SUUpdaterDefaults
     self = [super init];
     if (bundle == nil) bundle = [NSBundle mainBundle];
 
+    self.sparkleBundle = [NSBundle bundleForClass:[self class]];
+    if (!self.sparkleBundle) {
+        SULog(@"Error: SUUpdater can't find Sparkle.framework it belongs to");
+        return nil;
+    }
+
     // Register as observer straight away to avoid exceptions on -dealloc when -unregisterAsObserver is called:
     if (self) {
         [self registerAsObserver];
@@ -104,14 +111,23 @@ static NSString *const SUUpdaterDefaultsObservationContext = @"SUUpdaterDefaults
         BOOL hasPublicDSAKey = [host publicDSAKey] != nil;
         BOOL isMainBundle = [bundle isEqualTo:[NSBundle mainBundle]];
         BOOL hostIsCodeSigned = [SUCodeSigningVerifier hostApplicationIsCodeSigned];
+        BOOL servingOverHttps = [[[[self feedURL] scheme] lowercaseString] isEqualToString:@"https"];
         if (!isMainBundle && !hasPublicDSAKey) {
             [self notifyWillShowModalAlert];
-            NSRunAlertPanel(@"Insecure update error!", @"For security reasons, you need to sign your updates with a DSA key. See Sparkle's documentation for more information.", @"OK", nil, nil);
+            NSAlert *alert = [[NSAlert alloc] init];
+            alert.messageText = @"Insecure update error!";
+            alert.informativeText = @"For security reasons, you need to sign your updates with a DSA key. See Sparkle's documentation for more information.";
+            [alert runModal];
             [self notifyDidShowModalAlert];
         } else if (isMainBundle && !(hasPublicDSAKey || hostIsCodeSigned)) {
             [self notifyWillShowModalAlert];
-            NSRunAlertPanel(@"Insecure update error!", @"For security reasons, you need to code sign your application or sign your updates with a DSA key. See Sparkle's documentation for more information.", @"OK", nil, nil);
+            NSAlert *alert = [[NSAlert alloc] init];
+            alert.messageText = @"Insecure update error!";
+            alert.informativeText = @"For security reasons, you need to code sign your application or sign your updates with a DSA key. See Sparkle's documentation for more information.";
+            [alert runModal];
             [self notifyDidShowModalAlert];
+        } else if (isMainBundle && !hasPublicDSAKey && !servingOverHttps) {
+            SULog(@"WARNING: Serving updates over http without signing them with a DSA key is deprecated and may not be possible in a future release. Please serve your updates over https, or sign them with a DSA key, or do both. See Sparkle's documentation for more information.");
         }
 
         // This runs the permission prompt if needed, but never before the app has finished launching because the runloop won't run before that
@@ -147,38 +163,28 @@ static NSString *const SUUpdaterDefaultsObservationContext = @"SUUpdaterDefaults
 - (void)startUpdateCycle
 {
     BOOL shouldPrompt = NO;
+    BOOL hasLaunchedBefore = [self.host boolForUserDefaultsKey:SUHasLaunchedBeforeKey];
 
     // If the user has been asked about automatic checks, don't bother prompting
-	if ([self.host objectForUserDefaultsKey:SUEnableAutomaticChecksKey])
-    {
+    if ([self.host objectForUserDefaultsKey:SUEnableAutomaticChecksKey]) {
         shouldPrompt = NO;
     }
     // Does the delegate want to take care of the logic for when we should ask permission to update?
-    else if ([self.delegate respondsToSelector:@selector(updaterShouldPromptForPermissionToCheckForUpdates:)])
-    {
+    else if ([self.delegate respondsToSelector:@selector(updaterShouldPromptForPermissionToCheckForUpdates:)]) {
         shouldPrompt = [self.delegate updaterShouldPromptForPermissionToCheckForUpdates:self];
     }
     // Has he been asked already? And don't ask if the host has a default value set in its Info.plist.
-    else if ([self.host objectForKey:SUEnableAutomaticChecksKey] == nil)
-    {
-        if ([self.host objectForUserDefaultsKey:SUEnableAutomaticChecksKeyOld]) {
-            [self setAutomaticallyChecksForUpdates:[self.host boolForUserDefaultsKey:SUEnableAutomaticChecksKeyOld]];
-        }
+    else if ([self.host objectForKey:SUEnableAutomaticChecksKey] == nil) {
         // Now, we don't want to ask the user for permission to do a weird thing on the first launch.
         // We wait until the second launch, unless explicitly overridden via SUPromptUserOnFirstLaunchKey.
-        else if (![self.host objectForKey:SUPromptUserOnFirstLaunchKey])
-        {
-            if ([self.host boolForUserDefaultsKey:SUHasLaunchedBeforeKey] == NO)
-                [self.host setBool:YES forUserDefaultsKey:SUHasLaunchedBeforeKey];
-            else
-                shouldPrompt = YES;
-        }
-        else
-            shouldPrompt = YES;
+        shouldPrompt = [self.host objectForKey:SUPromptUserOnFirstLaunchKey] || hasLaunchedBefore;
     }
 
-    if (shouldPrompt)
-    {
+    if (!hasLaunchedBefore) {
+        [self.host setBool:YES forUserDefaultsKey:SUHasLaunchedBeforeKey];
+    }
+
+    if (shouldPrompt) {
         NSArray *profileInfo = [self.host systemProfile];
         // Always say we're sending the system profile here so that the delegate displays the parameters it would send.
         if ([self.delegate respondsToSelector:@selector(feedParametersForUpdater:sendingSystemProfile:)]) {
@@ -186,9 +192,7 @@ static NSString *const SUUpdaterDefaultsObservationContext = @"SUUpdaterDefaults
         }
         [SUUpdatePermissionPrompt promptWithHost:self.host systemProfile:profileInfo delegate:self];
         // We start the update checks and register as observer for changes after the prompt finishes
-	}
-    else
-    {
+    } else {
         // We check if the user's said they want updates, or they haven't said anything, and the default is set to checking.
         [self scheduleNextUpdateCheck];
     }
@@ -334,9 +338,6 @@ static NSString *const SUUpdaterDefaultsObservationContext = @"SUUpdaterDefaults
 	if ([self updateInProgress]) { return; }
 	if (self.checkTimer) { [self.checkTimer invalidate]; self.checkTimer = nil; }		// Timer is non-repeating, may have invalidated itself, so we had to retain it.
 
-    SUClearLog();
-    SULog(@"===== %@ =====", [[NSFileManager defaultManager] displayNameAtPath:[[NSBundle mainBundle] bundlePath]]);
-
     [self willChangeValueForKey:@"lastUpdateCheckDate"];
     [self.host setObject:[NSDate date] forUserDefaultsKey:SULastCheckTimeKey];
     [self didChangeValueForKey:@"lastUpdateCheckDate"];
@@ -476,7 +477,7 @@ static NSString *const SUUpdaterDefaultsObservationContext = @"SUUpdaterDefaults
         return customUserAgentString;
     }
 
-    NSString *version = [[NSBundle bundleWithIdentifier:SUBundleIdentifier] objectForInfoDictionaryKey:(__bridge NSString *)kCFBundleVersionKey];
+    NSString *version = [self.sparkleBundle objectForInfoDictionaryKey:(__bridge NSString *)kCFBundleVersionKey];
     NSString *userAgent = [NSString stringWithFormat:@"%@/%@ Sparkle/%@", [self.host name], [self.host displayVersion], version ? version : @"?"];
     NSData *cleanedAgent = [userAgent dataUsingEncoding:NSASCIIStringEncoding allowLossyConversion:YES];
     return [[NSString alloc] initWithData:cleanedAgent encoding:NSASCIIStringEncoding];
